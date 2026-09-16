@@ -32,27 +32,38 @@ TRACE_DB=./traces.db TRACE_TOKEN=一个长随机串 \
 |---|---|---|
 | `TRACE_DB` | `./traces.db` | SQLite 路径 |
 | `TRACE_TOKEN` | 空 | **管理员令牌**：设置后 `/ingest` 与 `/api` 需 `Authorization: Bearer <token>`；静态页（门户/轨迹壳）不拦截 |
-| `TRACE_TOKENS_FILE` | 空 | 多用户令牌文件（JSON，见 §2）；按用户/实例隔离读权限 |
+| `TRACE_TOKENS_FILE` | 空 | 多用户令牌**种子文件**（JSON，见 §2）：仅首次导入 DB，之后以管理台为准 |
 | `TRACE_UI_DIR` | `./ui` | 轨迹壳目录；删除则 `/trace` 关闭 |
 | `TRACE_PORTAL_DIR` | `./portal` | 门户目录 |
 
 ## 2. 多用户令牌与作用域隔离
 
 单一共享 `TRACE_TOKEN` 时人人都是管理员 —— 单人运维没问题，多人
-共享就会互相看见全部对话。多用户部署改用令牌文件（`TRACE_TOKENS_FILE`）：
+共享就会互相看见全部对话。多用户部署改用**管理台发放令牌**：
 
-```json
-{
-  "tok_alice_9f2c":  {"name": "alice",  "users": ["alice@wecom"]},
-  "tok_shanghai_7d1": {"name": "上海机房", "instances": ["edge-shanghai-01"]},
-  "tok_auditor_3e":  {"name": "审计",   "users": null, "instances": null}
-}
+1. 用管理员令牌（`TRACE_TOKEN`）登录门户 `/`，出现"令牌管理"区；
+2. 填显示名 + 作用域 → 发放 → 明文令牌**仅显示一次**，复制发给本人；
+3. 吊销即时生效（持有者下一次请求即 401），发放同样即时生效。
+
+等价的管理 API（管理员令牌专用，受限令牌访问返回 404）：
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN" \
+     localhost:8790/api/agent-trace/admin/tokens          # 列表（令牌打码）
+curl -s -H "Authorization: Bearer $ADMIN" \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"alice","users":["alice@wecom"]}' \
+     localhost:8790/api/agent-trace/admin/tokens          # 发放
+curl -s -X DELETE -H "Authorization: Bearer $ADMIN" \
+     localhost:8790/api/agent-trace/admin/tokens/7        # 吊销
 ```
+
+作用域语义（管理台表单与 API 一致）：
 
 - `users` / `instances` 是允许列表，匹配会话的 `user_id`（渠道用户
   身份）与 `instance_id`（边端机器身份）；**两个维度同时给出时需
   同时满足**（AND）。
-- `null` 或缺省 = 该维度不受限；两个都为 `null` 等同管理员。
+- 都留空 = 管理员级令牌（全量可见，谨慎发放）。
 - 隔离语义：受限令牌的会话列表、会话详情、stats、export、overview、
   instances 全部按作用域过滤；**跨作用域访问返回 404 而非 403**，
   不泄露"该会话存在"。无 `user_id` 的会话（如 Console 直连）对
@@ -61,10 +72,24 @@ TRACE_DB=./traces.db TRACE_TOKEN=一个长随机串 \
   `remote_token` 可直接复用受限令牌。
 - `GET /api/agent-trace/whoami` 返回当前令牌身份与作用域（门户
   登录后头部展示用）。
-- `TRACE_TOKEN`（管理员）与令牌文件可并存；令牌文件不可读时仅
-  管理员令牌生效（启动日志有 warning）。
 
-生成令牌建议 `python -c "import secrets;print('tok_'+secrets.token_urlsafe(18))"`。
+令牌持久化在 SQLite 的 `tokens` 表（`TRACE_DB` 同库）。批量初始化
+可用 `TRACE_TOKENS_FILE`（JSON）作**种子**：启动时导入 DB 中不存在的
+令牌，**不覆盖**管理台已改动/已吊销的记录 —— 运行期以 DB 为准：
+
+```json
+{
+  "tok_alice_9f2c":  {"name": "alice",  "users": ["alice@wecom"]},
+  "tok_shanghai_7d1": {"name": "上海机房", "instances": ["edge-shanghai-01"]}
+}
+```
+
+注意：一旦存在任何令牌（环境管理员令牌或 DB 中有效令牌），服务即
+要求认证 —— 开放模式（无令牌）下发放的第一个令牌会立即让匿名访问
+变成 401。`TRACE_TOKEN`（管理员）与令牌文件可并存；文件不可读时仅
+管理员令牌生效（启动日志有 warning）。
+
+生成令牌串（手工造种子文件时）：`python -c "import secrets;print('tok_'+secrets.token_urlsafe(24))"`。
 
 ## 3. 边端开启推送（每台 QwenPaw）
 

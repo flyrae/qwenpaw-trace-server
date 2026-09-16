@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -55,6 +56,15 @@ CREATE TABLE IF NOT EXISTS sessions(
     event_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(instance_id, session_id)
 );
+CREATE TABLE IF NOT EXISTS tokens(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL DEFAULT '',
+    users TEXT,
+    instances TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT
+);
 """
 
 
@@ -79,6 +89,99 @@ class TraceDatabase:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+    # ------------------------------------------------------------------
+    # Tokens (admin-issued client tokens; DB is the source of truth
+    # once seeded, so issue/revoke take effect without a restart)
+    # ------------------------------------------------------------------
+
+    def lookup_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Active token row decoded into {name, users, instances};
+        None when unknown or revoked."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT name, users, instances FROM tokens"
+                " WHERE token=? AND revoked=0",
+                (token,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "name": row["name"],
+            "users": _json_list(row["users"]),
+            "instances": _json_list(row["instances"]),
+        }
+
+    def count_active_tokens(self) -> int:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) AS n FROM tokens WHERE revoked=0"
+            ).fetchone()
+        return int(row["n"])
+
+    def insert_token(
+        self,
+        token: str,
+        name: str,
+        users: Optional[List[str]],
+        instances: Optional[List[str]],
+    ) -> Optional[int]:
+        """Insert one token, returning its row id; None when the
+        token string already exists (seeding never overwrites
+        admin-console changes)."""
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO tokens"
+                "(token, name, users, instances, created_at)"
+                " VALUES(?, ?, ?, ?, ?)",
+                (
+                    token,
+                    name,
+                    json.dumps(users) if users is not None else None,
+                    json.dumps(instances)
+                    if instances is not None
+                    else None,
+                    now,
+                ),
+            )
+            row_id = cursor.lastrowid if cursor.rowcount == 1 else None
+            self._db.commit()
+        return row_id
+
+    def list_tokens(self) -> List[Dict[str, Any]]:
+        """All tokens (including revoked, for the audit trail)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, token, name, users, instances, revoked,"
+                " created_at FROM tokens ORDER BY id DESC"
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "token": row["token"],
+                "name": row["name"],
+                "users": _json_list(row["users"]),
+                "instances": _json_list(row["instances"]),
+                "revoked": bool(row["revoked"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def token_exists(self, token_id: int) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM tokens WHERE id=?", (token_id,)
+            ).fetchone()
+        return row is not None
+
+    def revoke_token(self, token_id: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE tokens SET revoked=1 WHERE id=?", (token_id,)
+            )
+            self._db.commit()
 
     # ------------------------------------------------------------------
     # Ingest
@@ -658,6 +761,20 @@ class TraceDatabase:
         for key in ("llm_ms_total", "tool_ms_total", "decode_ms_total"):
             stats[key] = round(stats[key], 1)
         return stats
+
+
+def _json_list(value: Optional[str]) -> Optional[List[str]]:
+    """Decode a JSON allow-list column; null (and corrupt values)
+    mean unrestricted."""
+    if value is None:
+        return None
+    try:
+        items = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(items, list):
+        return None
+    return [str(item) for item in items]
 
 
 def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:

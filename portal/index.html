@@ -125,6 +125,43 @@
 
       .empty { padding: 42px; text-align: center; color: var(--ink-3); font-size: 13px; }
 
+      /* ── token admin ───────────────────────────────────── */
+      .form-row {
+        display: flex; gap: 10px; padding: 14px 16px;
+        border-bottom: 1px solid var(--line); flex-wrap: wrap;
+      }
+      .form-row input {
+        padding: 8px 10px; font-size: 13px;
+        border: 1px solid var(--line); border-radius: 8px; outline: none;
+      }
+      .form-row input:focus { border-color: var(--brand); }
+      .btn {
+        padding: 8px 16px; font-size: 13px; border: none;
+        border-radius: 8px; cursor: pointer;
+        background: var(--brand); color: #fff;
+      }
+      .btn:hover { background: #1d4ed8; }
+      .btn.ghost {
+        background: none; border: 1px solid var(--line);
+        color: var(--ink-2);
+      }
+      button.danger {
+        background: none; border: none; color: var(--err);
+        cursor: pointer; font-size: 12px; padding: 0;
+      }
+      button.danger:hover { text-decoration: underline; }
+      .issued {
+        margin: 14px 16px 0; padding: 12px 14px;
+        background: #f0fdf4; border: 1px solid #bbf7d0;
+        border-radius: 8px; font-size: 13px;
+      }
+      .issued code {
+        font-family: ui-monospace, Consolas, monospace;
+        word-break: break-all;
+      }
+      td code { font-family: ui-monospace, Consolas, monospace; }
+      .footnote { font-size: 12px; color: var(--ink-3); margin-top: 8px; }
+
       /* ── login gate ─────────────────────────────────────── */
       #gate {
         min-height: calc(100vh - 56px);
@@ -220,6 +257,30 @@
           <div class="empty hidden" id="recent-empty">暂无会话 —— 与智能体对话后出现在这里</div>
         </div>
       </div>
+
+      <div class="section hidden" id="token-section">
+        <h2>令牌管理 <span class="count" id="token-count"></span></h2>
+        <div class="card">
+          <div class="form-row">
+            <input id="tok-name" placeholder="显示名称，如 alice" style="width: 170px" />
+            <input id="tok-users" placeholder="用户 allow-list，逗号分隔（如 alice@wecom）" style="flex: 1; min-width: 220px" />
+            <input id="tok-insts" placeholder="实例 allow-list，逗号分隔（如 edge-sh-01）" style="flex: 1; min-width: 220px" />
+            <button class="btn" id="tok-issue">发放令牌</button>
+          </div>
+          <div class="issued hidden" id="tok-issued"></div>
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th><th>令牌</th><th>作用域</th>
+                <th>状态</th><th>创建于</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="tok-rows"></tbody>
+          </table>
+          <div class="empty hidden" id="tok-empty">还没有发放过令牌 —— 填写名称与作用域后点"发放令牌"</div>
+        </div>
+        <p class="footnote">用户 / 实例都留空 = 管理员级令牌（全量可见）。明文令牌仅在发放时显示一次，请立即复制发给本人；吊销即时生效。</p>
+      </div>
     </div>
 
     <script>
@@ -233,6 +294,20 @@
       async function api(path) {
         const resp = await fetch(API + path, {
           headers: { Authorization: "Bearer " + token() },
+        });
+        if (resp.status === 401) throw { unauthorized: true };
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+      }
+
+      async function apiSend(method, path, body) {
+        const resp = await fetch(API + path, {
+          method,
+          headers: Object.assign(
+            { Authorization: "Bearer " + token() },
+            body ? { "Content-Type": "application/json" } : {},
+          ),
+          body: body ? JSON.stringify(body) : undefined,
         });
         if (resp.status === 401) throw { unauthorized: true };
         if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -338,6 +413,106 @@
           );
       }
 
+      // ── token admin (visible to unrestricted tokens only) ──
+      let isAdmin = false;
+      let tokensLoaded = false;
+
+      function scopeText(t) {
+        if (t.unrestricted) return '<span class="tag warn">管理员</span>';
+        const parts = [];
+        if (t.users && t.users.length)
+          parts.push("👤 " + esc(t.users.join(", ")));
+        if (t.instances && t.instances.length)
+          parts.push("🖥 " + esc(t.instances.join(", ")));
+        return parts.join("<br>") || '<span class="muted">—</span>';
+      }
+
+      function renderTokens(list) {
+        const active = list.filter((t) => !t.revoked).length;
+        $("token-count").textContent = active + " 个有效 / " + list.length + " 个总计";
+        $("tok-empty").classList.toggle("hidden", list.length > 0);
+        $("tok-rows").innerHTML = list
+          .map(
+            (t) =>
+              "<tr><td><b>" + esc(t.name) + '</b></td><td><code class="muted">' +
+              esc(t.token) + "</code></td><td>" + scopeText(t) + "</td><td>" +
+              (t.revoked
+                ? '<span class="tag err">已吊销</span>'
+                : '<span class="tag ok">有效</span>') +
+              '</td><td class="muted">' + esc(t.created_at || "—") +
+              "</td><td>" +
+              (t.revoked
+                ? ""
+                : '<button class="danger" data-id="' + t.id + '">吊销</button>') +
+              "</td></tr>",
+          )
+          .join("");
+        document
+          .querySelectorAll("#tok-rows button.danger")
+          .forEach((btn) =>
+            btn.addEventListener("click", () =>
+              revokeToken(Number(btn.dataset.id)),
+            ),
+          );
+      }
+
+      async function loadTokens() {
+        if (!isAdmin) return;
+        try {
+          renderTokens((await api("/admin/tokens")).tokens);
+        } catch (exc) {
+          if (!exc || !exc.unauthorized) console.warn(exc);
+        }
+      }
+
+      async function revokeToken(id) {
+        if (!confirm("吊销该令牌？持有者下一次请求即失效。")) return;
+        try {
+          await apiSend("DELETE", "/admin/tokens/" + id);
+          loadTokens();
+        } catch (exc) {
+          alert("吊销失败：" + (exc.message || exc));
+        }
+      }
+
+      $("tok-issue").addEventListener("click", async () => {
+        const name = $("tok-name").value.trim();
+        if (!name) {
+          alert("请填写显示名称");
+          return;
+        }
+        const split = (value) =>
+          value.split(",").map((s) => s.trim()).filter(Boolean);
+        const body = { name };
+        const users = split($("tok-users").value);
+        const instances = split($("tok-insts").value);
+        if (users.length) body.users = users;
+        if (instances.length) body.instances = instances;
+        try {
+          const issued = await apiSend("POST", "/admin/tokens", body);
+          const box = $("tok-issued");
+          box.classList.remove("hidden");
+          box.innerHTML =
+            "✅ 已发放 <b>" + esc(issued.name) +
+            "</b> 的令牌（仅显示这一次）：<code>" + esc(issued.token) +
+            '</code> <button class="btn ghost" id="tok-copy">复制</button>';
+          $("tok-copy").addEventListener("click", async (event) => {
+            try {
+              await navigator.clipboard.writeText(issued.token);
+              event.target.textContent = "已复制";
+            } catch (err) {
+              event.target.textContent = "复制失败，请手动选择";
+            }
+          });
+          $("tok-name").value = "";
+          $("tok-users").value = "";
+          $("tok-insts").value = "";
+          loadTokens();
+        } catch (exc) {
+          alert("发放失败：" + (exc.message || exc));
+        }
+      });
+
       async function tick() {
         try {
           const data = await api("/overview");
@@ -346,6 +521,17 @@
           $("health-dot").classList.remove("off");
           $("health-text").textContent = "服务正常";
           renderOverview(data);
+          try {
+            const me = await api("/whoami");
+            isAdmin = !me.restricted;
+          } catch (exc) {
+            isAdmin = false;
+          }
+          $("token-section").classList.toggle("hidden", !isAdmin);
+          if (isAdmin && !tokensLoaded) {
+            tokensLoaded = true;
+            loadTokens();
+          }
         } catch (exc) {
           if (exc && exc.unauthorized) {
             $("dash").classList.add("hidden");

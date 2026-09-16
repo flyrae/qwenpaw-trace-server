@@ -278,18 +278,21 @@ class TestIngest:
 
 
 class TestTokenStoreUnit:
-    """auth.py parsing rules, without HTTP."""
+    """auth.py parsing + DB-backed lookup, without HTTP."""
 
     def _store(self, tmp_path, spec, admin="admin-tok"):
         path = tmp_path / "tokens.json"
         path.write_text(spec, encoding="utf-8")
         import auth
+        from storage import TraceDatabase
 
+        db = TraceDatabase(tmp_path / "unit.db")
         return auth.TokenStore.from_env(
             {
                 "TRACE_TOKEN": admin,
                 "TRACE_TOKENS_FILE": str(path),
-            }
+            },
+            db,
         )
 
     def test_spec_shapes(self, tmp_path):
@@ -304,18 +307,32 @@ class TestTokenStoreUnit:
                 }
             ),
         )
-        assert set(store.scopes) == {"admin-tok", "t1", "t2", "t3"}
-        assert store.scopes["t1"].users == frozenset({"solo@wecom"})
-        assert store.scopes["t2"].instances == frozenset(
+        assert store.lookup("t1").users == frozenset({"solo@wecom"})
+        assert store.lookup("t2").instances == frozenset(
             {"edge-1", "edge-2"}
         )
         # An empty allow-list means unrestricted, not "see nothing".
-        assert store.scopes["t3"].unrestricted
+        assert store.lookup("t3").unrestricted
+        # Admin token resolves unrestricted regardless of the file.
+        assert store.lookup("admin-tok").unrestricted
+        assert store.lookup("nope") is None
+        assert store.lookup("") is None
+        assert store.auth_enabled
 
     def test_unreadable_file_keeps_admin_only(self, tmp_path):
         store = self._store(tmp_path, "{ not json")
-        assert set(store.scopes) == {"admin-tok"}
-        assert store.scopes["admin-tok"].unrestricted
+        assert store.lookup("admin-tok").unrestricted
+        assert store.lookup("t1") is None
+        assert store.auth_enabled
+
+    def test_open_mode_disabled_until_first_token(self, tmp_path):
+        import auth
+        from storage import TraceDatabase
+
+        store = auth.TokenStore(TraceDatabase(tmp_path / "open.db"))
+        assert not store.auth_enabled
+        store.db.insert_token("tok-x", "x", ["u"], None)
+        assert store.auth_enabled
 
     def test_can_view_semantics(self):
         from auth import Scope

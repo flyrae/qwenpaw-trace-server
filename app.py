@@ -10,9 +10,13 @@ Environment:
     TRACE_TOKEN  admin token; when set, all endpoints require
                  `Authorization: Bearer <token>`; when unset the
                  server is open (private network / gateway auth)
-    TRACE_TOKENS_FILE  JSON map of per-user tokens with user/instance
-                 read scopes (see auth.py); ingest accepts any valid
-                 token, reads are filtered by scope
+    TRACE_TOKENS_FILE  JSON map seeding per-user tokens with
+                 user/instance read scopes (see auth.py); it only
+                 seeds the DB — afterwards the admin console
+                 (POST /api/agent-trace/admin/tokens) is the source
+                 of truth and issue/revoke apply immediately.
+                 Ingest accepts any valid token, reads are filtered
+                 by scope
     TRACE_UI_DIR static UI directory (default: <repo>/server/ui)
 """
 from __future__ import annotations
@@ -21,13 +25,15 @@ import gzip
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from auth import Scope, TokenStore
 from storage import TraceDatabase
@@ -37,23 +43,18 @@ logger = logging.getLogger("agent-trace-server")
 
 SERVER_ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TRACE_DB") or SERVER_ROOT / "traces.db")
-TOKEN = (os.environ.get("TRACE_TOKEN") or "").strip()
 UI_DIR = Path(os.environ.get("TRACE_UI_DIR") or SERVER_ROOT / "ui")
 
 MAX_BATCH_EVENTS = 50_000
 
-app = FastAPI(title="agent-trace collector", version="0.3.0")
+app = FastAPI(title="agent-trace collector", version="0.4.0")
 db = TraceDatabase(DB_PATH)
-tokens = TokenStore.from_env(os.environ)
-if tokens:
-    restricted = sum(
-        1 for s in tokens.scopes.values() if not s.unrestricted
-    )
-    logger.info(
-        "agent-trace server: %d token(s) loaded (%d restricted)",
-        len(tokens.scopes),
-        restricted,
-    )
+tokens = TokenStore.from_env(os.environ, db)
+logger.info(
+    "agent-trace server: admin token %s, %d active client token(s)",
+    "set" if tokens.admin_token else "unset (open mode)",
+    tokens.token_count(),
+)
 
 # Standalone-UI deployments serve the bundle from another origin;
 # same-origin (default) works without CORS too.
@@ -67,7 +68,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    if tokens:
+    if tokens.auth_enabled:
         path = request.url.path
         public = (
             path == "/healthz"
@@ -193,6 +194,100 @@ async def list_sessions(
 async def whoami(request: Request) -> Dict[str, Any]:
     """Identity + scope of the current token (portal header)."""
     return _scope(request).to_dict()
+
+
+# ----------------------------------------------------------------------
+# Admin API — token issuance (unrestricted tokens only; scoped tokens
+# get 404 so the surface itself stays unknown)
+# ----------------------------------------------------------------------
+
+
+class TokenCreate(BaseModel):
+    name: str
+    users: Optional[List[str]] = None
+    instances: Optional[List[str]] = None
+
+
+def _require_admin(request: Request) -> None:
+    if not _scope(request).unrestricted:
+        raise HTTPException(404, "not found")
+
+
+def _mask_token(token: str) -> str:
+    if len(token) <= 16:
+        return token[:8] + "…"
+    return f"{token[:12]}…{token[-4:]}"
+
+
+def _clean_allow_list(value: Optional[List[str]]) -> Optional[List[str]]:
+    """Strip blanks; an empty list means unrestricted, not "nothing"."""
+    if value is None:
+        return None
+    items = [str(item).strip() for item in value if str(item).strip()]
+    return items or None
+
+
+@app.get("/api/agent-trace/admin/tokens")
+async def admin_list_tokens(request: Request) -> Dict[str, Any]:
+    _require_admin(request)
+    return {
+        "admin_env": bool(tokens.admin_token),
+        "tokens": [
+            {
+                "id": row["id"],
+                "token": _mask_token(row["token"]),
+                "name": row["name"],
+                "users": row["users"],
+                "instances": row["instances"],
+                "unrestricted": (
+                    row["users"] is None and row["instances"] is None
+                ),
+                "revoked": row["revoked"],
+                "created_at": row["created_at"],
+            }
+            for row in db.list_tokens()
+        ],
+    }
+
+
+@app.post(
+    "/api/agent-trace/admin/tokens",
+    status_code=201,
+)
+async def admin_create_token(
+    request: Request, spec: TokenCreate
+) -> Dict[str, Any]:
+    """Issue a client token. The plaintext token is returned exactly
+    once — later views only show a masked form."""
+    _require_admin(request)
+    name = spec.name.strip()
+    if not name:
+        raise HTTPException(422, "name is required")
+    users = _clean_allow_list(spec.users)
+    instances = _clean_allow_list(spec.instances)
+    token = "tok_" + secrets.token_urlsafe(24)
+    row_id = db.insert_token(token, name, users, instances)
+    if row_id is None:  # pragma: no cover — 192-bit random collision
+        raise HTTPException(500, "token collision, retry")
+    return {
+        "id": row_id,
+        "token": token,
+        "name": name,
+        "users": users,
+        "instances": instances,
+    }
+
+
+@app.delete("/api/agent-trace/admin/tokens/{token_id}")
+async def admin_revoke_token(
+    request: Request, token_id: int
+) -> Dict[str, Any]:
+    """Revoke by row id; effective on the very next request."""
+    _require_admin(request)
+    if not db.token_exists(token_id):
+        raise HTTPException(404, "not found")
+    db.revoke_token(token_id)
+    return {"ok": True}
 
 
 @app.get("/api/agent-trace/instances")
