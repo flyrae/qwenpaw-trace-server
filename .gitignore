@@ -5,3 +5,4 @@ __pycache__/
 traces.db
 ui/vendor/
 ui/app.js
+tokens.json
