@@ -91,6 +91,32 @@ curl -s -X DELETE -H "Authorization: Bearer $ADMIN" \
 
 生成令牌串（手工造种子文件时）：`python -c "import secrets;print('tok_'+secrets.token_urlsafe(24))"`。
 
+### 2.1 设备自助注册（enrollment，适合批量边端）
+
+几百台边端逐台发令牌不现实。管理员改为生成一个**注册凭据**
+（enroll key，可限次数/设有效期/可吊销），边端首次加载时自动注册
+并领取"仅本实例"作用域的最小权限令牌：
+
+```bash
+# 管理台"设备注册"区生成，或等价 API：
+curl -s -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+     -d '{"name":"华东机房 9 月批","max_uses":200,"expires_days":14}' \
+     localhost:8790/api/agent-trace/admin/enroll-keys   # 明文仅此一次
+```
+
+- 边端在 `traces/config.json` 配 `remote_enroll_key`（插件 ≥ v0.8.0），
+  首次加载调用 `POST /enroll` 上报自身 `instance_id`，服务端吊销该
+  实例旧令牌（轮换）并发新令牌，边端持久化到
+  `<WORKING_DIR>/traces/.instance-token`，之后一直用它；
+- 令牌被吊销/失效时边端收到 401 自动重新注册（凭据仍有效时）；
+- 注册凭据**只**能用于 `/enroll`，不能当 Bearer 令牌访问任何其它
+  端点；吊销凭据不影响已发放的实例令牌；
+- 实例令牌在令牌管理列表中标记来源为"自动注册"。
+
+`POST /enroll` 请求体：`{"instance_id": "...", "hostname": "..."}`
++ `Authorization: Bearer <注册凭据>`；响应 `{"token", "name",
+"instances"}`（token 明文仅此一次）。
+
 ## 3. 边端开启推送（每台 QwenPaw）
 
 在插件仓库侧配置 `<WORKING_DIR>/traces/config.json`：
@@ -99,9 +125,14 @@ curl -s -X DELETE -H "Authorization: Bearer $ADMIN" \
 {
   "remote_enabled": true,
   "remote_url": "http://collector.internal:8790",
-  "remote_token": "同一个长随机串"
+  "remote_token": "手工发放的令牌",
+  "remote_enroll_key": "或：注册凭据，首次加载自动领取实例令牌"
 }
 ```
+
+令牌来源优先级（插件 ≥ v0.8.0）：持久化的实例令牌
+（`traces/.instance-token`，enroll 自动写入）> `remote_enroll_key`
+（首次自动注册）> `remote_token`（手工配置）。
 
 行为契约：**本地优先**（断网不影响本机轨迹）、批量推送（2s/200 条/1MB）、
 失败退避 + 落盘排队自动补传、队列上限丢旧、绝不阻塞智能体循环、

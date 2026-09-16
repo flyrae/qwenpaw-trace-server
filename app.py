@@ -34,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
 
 from auth import Scope, TokenStore
 from storage import TraceDatabase
@@ -47,7 +48,7 @@ UI_DIR = Path(os.environ.get("TRACE_UI_DIR") or SERVER_ROOT / "ui")
 
 MAX_BATCH_EVENTS = 50_000
 
-app = FastAPI(title="agent-trace collector", version="0.4.0")
+app = FastAPI(title="agent-trace collector", version="0.5.0")
 db = TraceDatabase(DB_PATH)
 tokens = TokenStore.from_env(os.environ, db)
 logger.info(
@@ -68,7 +69,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    if tokens.auth_enabled:
+    if tokens.auth_enabled and request.url.path != "/enroll":
         path = request.url.path
         public = (
             path == "/healthz"
@@ -136,6 +137,52 @@ async def ingest(request: Request) -> Dict[str, Any]:
         raise HTTPException(413, "batch too large")
     result = db.ingest(instance, events)
     return result
+
+
+# ----------------------------------------------------------------------
+# Enrollment — edge instances self-register with an admin-issued
+# bootstrap key and receive an instance-scoped token (least
+# privilege). Re-enrolling an instance rotates its token: the old
+# one dies, so a lost edge credential is recovered by re-enrolling.
+# ----------------------------------------------------------------------
+
+
+def _bearer(request: Request) -> str:
+    header = request.headers.get("Authorization") or ""
+    return header[7:].strip() if header.startswith("Bearer ") else ""
+
+
+@app.post("/enroll")
+async def enroll(request: Request) -> Dict[str, Any]:
+    key_row = db.get_valid_enroll_key(_bearer(request))
+    if key_row is None:
+        raise HTTPException(401, "invalid, expired, or exhausted key")
+    try:
+        body = json.loads(await request.body())
+    except ValueError as exc:
+        raise HTTPException(400, f"invalid json: {exc}") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "body must be an object")
+    instance_id = str(body.get("instance_id") or "").strip()
+    if not instance_id or len(instance_id) > 200:
+        raise HTTPException(400, "instance_id required (<= 200 chars)")
+    db.revoke_enrolled_tokens(instance_id)
+    token = "tok_" + secrets.token_urlsafe(24)
+    row_id = db.insert_token(
+        token,
+        name=instance_id,
+        users=None,
+        instances=[instance_id],
+        source="enroll",
+    )
+    if row_id is None:  # pragma: no cover — 192-bit random collision
+        raise HTTPException(500, "token collision, retry")
+    db.consume_enroll_use(key_row["id"])
+    return {
+        "token": token,
+        "name": instance_id,
+        "instances": [instance_id],
+    }
 
 
 # ----------------------------------------------------------------------
@@ -208,6 +255,12 @@ class TokenCreate(BaseModel):
     instances: Optional[List[str]] = None
 
 
+class EnrollKeyCreate(BaseModel):
+    name: str
+    max_uses: Optional[int] = None
+    expires_days: Optional[int] = None
+
+
 def _require_admin(request: Request) -> None:
     if not _scope(request).unrestricted:
         raise HTTPException(404, "not found")
@@ -244,6 +297,7 @@ async def admin_list_tokens(request: Request) -> Dict[str, Any]:
                 ),
                 "revoked": row["revoked"],
                 "created_at": row["created_at"],
+                "source": row["source"],
             }
             for row in db.list_tokens()
         ],
@@ -287,6 +341,82 @@ async def admin_revoke_token(
     if not db.token_exists(token_id):
         raise HTTPException(404, "not found")
     db.revoke_token(token_id)
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------
+# Admin API — enrollment keys (bootstrap credentials for /enroll)
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/agent-trace/admin/enroll-keys")
+async def admin_list_enroll_keys(request: Request) -> Dict[str, Any]:
+    _require_admin(request)
+    return {
+        "enroll_keys": [
+            {
+                "id": row["id"],
+                "key": _mask_token(row["key"]),
+                "name": row["name"],
+                "max_uses": row["max_uses"],
+                "uses": row["uses"],
+                "expires_at": row["expires_at"],
+                "revoked": bool(row["revoked"]),
+                "created_at": row["created_at"],
+            }
+            for row in db.list_enroll_keys()
+        ],
+    }
+
+
+@app.post(
+    "/api/agent-trace/admin/enroll-keys",
+    status_code=201,
+)
+async def admin_create_enroll_key(
+    request: Request, spec: EnrollKeyCreate
+) -> Dict[str, Any]:
+    """Issue an enrollment key. The plaintext key is returned
+    exactly once; distribute it to edge instances (config
+    remote_enroll_key) instead of per-machine tokens."""
+    _require_admin(request)
+    name = spec.name.strip()
+    if not name:
+        raise HTTPException(422, "name is required")
+    if spec.max_uses is not None and spec.max_uses < 1:
+        raise HTTPException(422, "max_uses must be >= 1")
+    if spec.expires_days is not None and spec.expires_days < 1:
+        raise HTTPException(422, "expires_days must be >= 1")
+    expires_at = (
+        (
+            datetime.now(timezone.utc) + timedelta(days=spec.expires_days)
+        ).isoformat(timespec="seconds")
+        if spec.expires_days
+        else None
+    )
+    key = "enroll_" + secrets.token_urlsafe(24)
+    row_id = db.insert_enroll_key(key, name, spec.max_uses, expires_at)
+    if row_id is None:  # pragma: no cover — 192-bit random collision
+        raise HTTPException(500, "key collision, retry")
+    return {
+        "id": row_id,
+        "key": key,
+        "name": name,
+        "max_uses": spec.max_uses,
+        "expires_at": expires_at,
+    }
+
+
+@app.delete("/api/agent-trace/admin/enroll-keys/{key_id}")
+async def admin_revoke_enroll_key(
+    request: Request, key_id: int
+) -> Dict[str, Any]:
+    """Revoke a bootstrap key; further /enroll calls with it 401.
+    Tokens already issued through it keep working."""
+    _require_admin(request)
+    if not db.enroll_key_exists(key_id):
+        raise HTTPException(404, "not found")
+    db.revoke_enroll_key(key_id)
     return {"ok": True}
 
 

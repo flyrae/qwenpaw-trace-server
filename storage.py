@@ -63,9 +63,25 @@ CREATE TABLE IF NOT EXISTS tokens(
     users TEXT,
     instances TEXT,
     revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT,
+    source TEXT NOT NULL DEFAULT 'admin'
+);
+CREATE TABLE IF NOT EXISTS enroll_keys(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL DEFAULT '',
+    max_uses INTEGER,
+    uses INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT
 );
 """
+
+# Column additions for DBs created before v0.5.0.
+_MIGRATIONS = (
+    ("tokens", "source", "ALTER TABLE tokens ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'"),
+)
 
 
 def _num(value: Any) -> float:
@@ -84,7 +100,17 @@ class TraceDatabase:
         self._db = sqlite3.connect(self._path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
+        self._migrate()
         self._db.commit()
+
+    def _migrate(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(tokens)")
+        }
+        for table, column, ddl in _MIGRATIONS:
+            if table == "tokens" and column not in columns:
+                self._db.execute(ddl)
 
     def close(self) -> None:
         with self._lock:
@@ -125,6 +151,7 @@ class TraceDatabase:
         name: str,
         users: Optional[List[str]],
         instances: Optional[List[str]],
+        source: str = "admin",
     ) -> Optional[int]:
         """Insert one token, returning its row id; None when the
         token string already exists (seeding never overwrites
@@ -133,8 +160,8 @@ class TraceDatabase:
         with self._lock:
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO tokens"
-                "(token, name, users, instances, created_at)"
-                " VALUES(?, ?, ?, ?, ?)",
+                "(token, name, users, instances, created_at, source)"
+                " VALUES(?, ?, ?, ?, ?, ?)",
                 (
                     token,
                     name,
@@ -143,6 +170,7 @@ class TraceDatabase:
                     if instances is not None
                     else None,
                     now,
+                    source,
                 ),
             )
             row_id = cursor.lastrowid if cursor.rowcount == 1 else None
@@ -154,7 +182,7 @@ class TraceDatabase:
         with self._lock:
             rows = self._db.execute(
                 "SELECT id, token, name, users, instances, revoked,"
-                " created_at FROM tokens ORDER BY id DESC"
+                " created_at, source FROM tokens ORDER BY id DESC"
             ).fetchall()
         return [
             {
@@ -165,6 +193,7 @@ class TraceDatabase:
                 "instances": _json_list(row["instances"]),
                 "revoked": bool(row["revoked"]),
                 "created_at": row["created_at"],
+                "source": row["source"] or "admin",
             }
             for row in rows
         ]
@@ -180,6 +209,87 @@ class TraceDatabase:
         with self._lock:
             self._db.execute(
                 "UPDATE tokens SET revoked=1 WHERE id=?", (token_id,)
+            )
+            self._db.commit()
+
+    def revoke_enrolled_tokens(self, instance_id: str) -> int:
+        """Revoke every active enroll-issued token for one instance
+        (re-enrollment rotates). Enrolled tokens always carry the
+        single-element allow-list [instance_id], stored via the same
+        json.dumps used on insert, so exact-match works."""
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE tokens SET revoked=1 WHERE source='enroll'"
+                " AND revoked=0 AND instances=?",
+                (json.dumps([instance_id]),),
+            )
+            self._db.commit()
+        return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Enrollment keys (bootstrap credentials for /enroll; distinct
+    # from client tokens — they never authorize anything else)
+    # ------------------------------------------------------------------
+
+    def get_valid_enroll_key(self, key: str) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, name, max_uses, uses, expires_at"
+                " FROM enroll_keys WHERE key=? AND revoked=0"
+                " AND (expires_at IS NULL OR expires_at > ?)"
+                " AND (max_uses IS NULL OR uses < max_uses)",
+                (key, now),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def consume_enroll_use(self, key_id: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE enroll_keys SET uses=uses+1 WHERE id=?",
+                (key_id,),
+            )
+            self._db.commit()
+
+    def insert_enroll_key(
+        self,
+        key: str,
+        name: str,
+        max_uses: Optional[int],
+        expires_at: Optional[str],
+    ) -> Optional[int]:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO enroll_keys"
+                "(key, name, max_uses, expires_at, created_at)"
+                " VALUES(?, ?, ?, ?, ?)",
+                (key, name, max_uses, expires_at, now),
+            )
+            row_id = cursor.lastrowid if cursor.rowcount == 1 else None
+            self._db.commit()
+        return row_id
+
+    def list_enroll_keys(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, key, name, max_uses, uses, expires_at,"
+                " revoked, created_at FROM enroll_keys ORDER BY id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def enroll_key_exists(self, key_id: int) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM enroll_keys WHERE id=?", (key_id,)
+            ).fetchone()
+        return row is not None
+
+    def revoke_enroll_key(self, key_id: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE enroll_keys SET revoked=1 WHERE id=?",
+                (key_id,),
             )
             self._db.commit()
 

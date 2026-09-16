@@ -272,14 +272,35 @@
             <thead>
               <tr>
                 <th>名称</th><th>令牌</th><th>作用域</th>
-                <th>状态</th><th>创建于</th><th></th>
+                <th>状态</th><th>来源</th><th>创建于</th><th></th>
               </tr>
             </thead>
             <tbody id="tok-rows"></tbody>
           </table>
           <div class="empty hidden" id="tok-empty">还没有发放过令牌 —— 填写名称与作用域后点"发放令牌"</div>
         </div>
-        <p class="footnote">用户 / 实例都留空 = 管理员级令牌（全量可见）。明文令牌仅在发放时显示一次，请立即复制发给本人；吊销即时生效。</p>
+
+        <h2 style="margin-top: 22px">设备注册 <span class="count" id="enroll-count"></span></h2>
+        <div class="card">
+          <div class="form-row">
+            <input id="ek-name" placeholder="批次名称，如 华东机房 9 月" style="width: 190px" />
+            <input id="ek-uses" placeholder="限用次数（空=无限）" style="width: 150px" inputmode="numeric" />
+            <input id="ek-days" placeholder="有效天数（空=永久）" style="width: 150px" inputmode="numeric" />
+            <button class="btn" id="ek-issue">生成注册凭据</button>
+          </div>
+          <div class="issued hidden" id="ek-issued"></div>
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th><th>凭据</th><th class="num">已用 / 上限</th>
+                <th>过期</th><th>状态</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="ek-rows"></tbody>
+          </table>
+          <div class="empty hidden" id="ek-empty">还没有注册凭据 —— 边端配置 remote_enroll_key 后首次加载会自动注册并领取实例级令牌</div>
+        </div>
+        <p class="footnote">注册凭据（enroll key）只用于边端首次接入 <code>POST /enroll</code>：边端上报自身 instance_id，自动领取"仅本实例"作用域的最小权限令牌；重复注册会轮换旧令牌。用户/实例都留空 = 管理员级令牌（全量可见）。明文仅显示一次，请立即复制。</p>
       </div>
     </div>
 
@@ -439,6 +460,10 @@
               (t.revoked
                 ? '<span class="tag err">已吊销</span>'
                 : '<span class="tag ok">有效</span>') +
+              "</td><td>" +
+              (t.source === "enroll"
+                ? '<span class="tag info">自动注册</span>'
+                : '<span class="tag plain">手工发放</span>') +
               '</td><td class="muted">' + esc(t.created_at || "—") +
               "</td><td>" +
               (t.revoked
@@ -513,6 +538,94 @@
         }
       });
 
+      // ── enrollment keys ────────────────────────────────────
+      function renderEnrollKeys(list) {
+        const active = list.filter((k) => !k.revoked).length;
+        $("enroll-count").textContent = active + " 个有效";
+        $("ek-empty").classList.toggle("hidden", list.length > 0);
+        $("ek-rows").innerHTML = list
+          .map(
+            (k) =>
+              "<tr><td><b>" + esc(k.name) + '</b></td><td><code class="muted">' +
+              esc(k.key) + '</td><td class="num">' + k.uses + " / " +
+              (k.max_uses == null ? "∞" : k.max_uses) + "</td><td class=\"muted\">" +
+              (k.expires_at ? esc(k.expires_at.slice(0, 10)) : "永久") +
+              "</td><td>" +
+              (k.revoked
+                ? '<span class="tag err">已吊销</span>'
+                : '<span class="tag ok">有效</span>') +
+              "</td><td>" +
+              (k.revoked
+                ? ""
+                : '<button class="danger ek-del" data-id="' + k.id + '">吊销</button>') +
+              "</td></tr>",
+          )
+          .join("");
+        document
+          .querySelectorAll("#ek-rows .ek-del")
+          .forEach((btn) =>
+            btn.addEventListener("click", async () => {
+              if (!confirm("吊销该注册凭据？新设备将无法再注册（已发放的令牌不受影响）。")) return;
+              try {
+                await apiSend("DELETE", "/admin/enroll-keys/" + btn.dataset.id);
+                loadEnrollKeys();
+              } catch (exc) {
+                alert("吊销失败：" + (exc.message || exc));
+              }
+            }),
+          );
+      }
+
+      async function loadEnrollKeys() {
+        if (!isAdmin) return;
+        try {
+          renderEnrollKeys(
+            (await api("/admin/enroll-keys")).enroll_keys,
+          );
+        } catch (exc) {
+          if (!exc || !exc.unauthorized) console.warn(exc);
+        }
+      }
+
+      $("ek-issue").addEventListener("click", async () => {
+        const name = $("ek-name").value.trim();
+        if (!name) {
+          alert("请填写批次名称");
+          return;
+        }
+        const body = { name };
+        const uses = Number($("ek-uses").value);
+        const days = Number($("ek-days").value);
+        if ($("ek-uses").value.trim() !== "" && Number.isInteger(uses) && uses >= 1)
+          body.max_uses = uses;
+        if ($("ek-days").value.trim() !== "" && Number.isInteger(days) && days >= 1)
+          body.expires_days = days;
+        try {
+          const issued = await apiSend("POST", "/admin/enroll-keys", body);
+          const box = $("ek-issued");
+          box.classList.remove("hidden");
+          box.innerHTML =
+            "✅ 已生成注册凭据 <b>" + esc(issued.name) +
+            "</b>（仅显示这一次）：<code>" + esc(issued.key) +
+            '</code> <button class="btn ghost" id="ek-copy">复制</button>' +
+            '<div class="footnote" style="margin-top:6px">边端 config.json 设 "remote_enroll_key": 该值（首次加载自动注册）</div>';
+          $("ek-copy").addEventListener("click", async (event) => {
+            try {
+              await navigator.clipboard.writeText(issued.key);
+              event.target.textContent = "已复制";
+            } catch (err) {
+              event.target.textContent = "复制失败，请手动选择";
+            }
+          });
+          $("ek-name").value = "";
+          $("ek-uses").value = "";
+          $("ek-days").value = "";
+          loadEnrollKeys();
+        } catch (exc) {
+          alert("生成失败：" + (exc.message || exc));
+        }
+      });
+
       async function tick() {
         try {
           const data = await api("/overview");
@@ -531,6 +644,7 @@
           if (isAdmin && !tokensLoaded) {
             tokensLoaded = true;
             loadTokens();
+            loadEnrollKeys();
           }
         } catch (exc) {
           if (exc && exc.unauthorized) {
