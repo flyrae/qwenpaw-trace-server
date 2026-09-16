@@ -89,3 +89,32 @@ python smoke_e2e.py              # 真实 shipper→server→API→UI 全链路
                                 # （需本地有插件仓库 checkout，
                                 #  或设 TRACE_PLUGIN_ROOT 指向它）
 ```
+
+## 5. 容器部署（推荐生产形态）
+
+```bash
+# 前置：准备 UI 资源（vendored UMD + 插件 bundle）
+python ui/build-ui.py                  # 默认取兄弟目录 ../qwenpaw-trace/dist/index.js
+
+# 构建 + 运行（compose）
+TRACE_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(24))") \
+    docker compose up -d --build       # 数据持久化在 named volume trace-data
+
+# 或直接 docker
+docker build -t agent-trace-server:0.1 .
+docker run -d --name trace-server -p 8790:8790 \
+    -e TRACE_TOKEN=... -v trace-data:/data --restart unless-stopped \
+    agent-trace-server:0.1
+```
+
+镜像要点：`python:3.12-slim` + fastapi/uvicorn（仅两个依赖）；数据库
+固定在 `/data/traces.db`（volume 持久化）；内置 `HEALTHCHECK`（30s 探
+`/healthz`）；`TRACE_TOKEN` 默认留空（私网开放），生产必须设置。
+
+`smoke_e2e.py` 同样适用容器目标：起容器后把边端 `remote_url` 指过去
+即可（本仓库的 e2e 验证即用此方式跑通过：ingest → 聚合 → 门户 →
+轨迹壳 → 健康检查全部通过）。
+
+K8s 要点：`Deployment`（镜像 + `TRACE_TOKEN` from Secret）+
+`PersistentVolumeClaim` 挂 `/data` + `readinessProbe`/`livenessProbe`
+GET `/healthz`，无需其它特殊配置。

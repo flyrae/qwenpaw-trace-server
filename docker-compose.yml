@@ -1,0 +1,16 @@
+services:
+  agent-trace-server:
+    build: .
+    image: agent-trace-server:latest
+    container_name: agent-trace-server
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    environment:
+      # Generate one: python -c "import secrets;print(secrets.token_urlsafe(24))"
+      TRACE_TOKEN: ${TRACE_TOKEN:-}
+    volumes:
+      - trace-data:/data
+
+volumes:
+  trace-data:

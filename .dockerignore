@@ -1,0 +1,12 @@
+# Keep the context lean — but ui/vendor/ and ui/app.js are build
+# products the image NEEDS (produced by ui/build-ui.py); do not add
+# them here.
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+smoke_e2e.py
+traces.db
+*.zip
+ui/build-ui.py

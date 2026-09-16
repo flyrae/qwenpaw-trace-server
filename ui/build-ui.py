@@ -39,6 +39,13 @@ def main() -> int:
         "--console-node-modules",
         default=r"D:\develop\code\QwenPaw\console\node_modules",
     )
+    parser.add_argument(
+        "--bundle",
+        default=str(
+            UI_DIR.parent.parent / "qwenpaw-trace" / "dist" / "index.js"
+        ),
+        help="plugin bundle (frontend build output) to embed as app.js",
+    )
     args = parser.parse_args()
     node_modules = Path(args.console_node_modules)
 
