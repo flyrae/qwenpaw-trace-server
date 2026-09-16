@@ -1,0 +1,7 @@
+node_modules/
+__pycache__/
+.pytest_cache/
+*.zip
+traces.db
+ui/vendor/
+ui/app.js
