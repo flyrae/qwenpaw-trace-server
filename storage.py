@@ -290,6 +290,34 @@ class TraceDatabase:
     # Queries
     # ------------------------------------------------------------------
 
+    def _scope_clause(
+        self,
+        scope: Optional[Any],
+        prefix: str = "s",
+    ) -> tuple:
+        """SQL fragment enforcing a token scope (user/instance
+        allow-lists) as extra AND-conditions; ('', []) when
+        unrestricted. Sessions with an unknown/empty user_id (e.g.
+        console) are visible only to unrestricted tokens or
+        instance-scoped tokens whose list matches their instance."""
+        if scope is None or scope.unrestricted:
+            return "", []
+        clauses = []
+        params: list = []
+        if scope.users is not None:
+            placeholders = ",".join("?" for _ in scope.users)
+            clauses.append(
+                f"({prefix}.user_id IN ({placeholders}))"
+            )
+            params.extend(sorted(scope.users))
+        if scope.instances is not None:
+            placeholders = ",".join("?" for _ in scope.instances)
+            clauses.append(f"{prefix}.instance_id IN ({placeholders})")
+            params.extend(sorted(scope.instances))
+        if not clauses:
+            return "", []
+        return f" AND {' AND '.join(clauses)}", params
+
     def list_sessions(
         self,
         instance: Optional[str] = None,
@@ -297,6 +325,7 @@ class TraceDatabase:
         q: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        scope: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         where = []
         params: list = []
@@ -313,7 +342,11 @@ class TraceDatabase:
                 "(s.session_id LIKE ? OR s.title LIKE ? OR s.agent_id LIKE ?)"
             )
             params.extend([f"%{q}%"] * 3)
-        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        scope_sql, scope_params = self._scope_clause(scope)
+        clause = (
+            f"WHERE {' AND '.join(where)}{scope_sql}" if where
+            else f"WHERE 1=1{scope_sql}"
+        )
         rows = self._db.execute(
             f"""
             SELECT s.*, i.hostname FROM sessions s
@@ -322,7 +355,7 @@ class TraceDatabase:
             ORDER BY COALESCE(s.last_t, '') DESC, s.session_id DESC
             LIMIT ? OFFSET ?
             """,
-            (*params, limit, offset),
+            (*params, *scope_params, limit, offset),
         ).fetchall()
         summaries = []
         for row in rows:
@@ -356,6 +389,7 @@ class TraceDatabase:
         instance: Optional[str] = None,
         user: Optional[str] = None,
         q: Optional[str] = None,
+        scope: Optional[Any] = None,
     ) -> int:
         where = []
         params: list = []
@@ -368,10 +402,14 @@ class TraceDatabase:
         if q:
             where.append("(session_id LIKE ? OR title LIKE ?)")
             params.extend([f"%{q}%"] * 2)
-        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        scope_sql, scope_params = self._scope_clause(scope)
+        clause = (
+            f"WHERE {' AND '.join(where)}{scope_sql}" if where
+            else f"WHERE 1=1{scope_sql}"
+        )
         row = self._db.execute(
-            f"SELECT COUNT(*) AS n FROM sessions {clause}",
-            params,
+            f"SELECT COUNT(*) AS n FROM sessions s {clause}",
+            (*params, *scope_params),
         ).fetchone()
         return int(row["n"])
 
@@ -446,17 +484,39 @@ class TraceDatabase:
         ).fetchall()
         return [_row_to_event(row) for row in rows]
 
-    def list_instances(self) -> List[Dict[str, Any]]:
-        rows = self._db.execute(
-            "SELECT * FROM instances ORDER BY last_seen DESC"
-        ).fetchall()
+    def list_instances(
+        self,
+        scope: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Known instances; a restricted scope narrows to instances
+        the token can actually see (has at least one in-scope
+        session), mirroring the overview rollup."""
+        scope_sql, scope_params = self._scope_clause(scope)
+        if scope_params:
+            rows = self._db.execute(
+                f"""
+                SELECT i.* FROM instances i
+                JOIN sessions s
+                    ON s.instance_id = i.instance_id{scope_sql}
+                GROUP BY i.instance_id
+                HAVING COUNT(s.session_id) > 0
+                ORDER BY i.last_seen DESC
+                """,
+                scope_params,
+            ).fetchall()
+        else:
+            rows = self._db.execute(
+                "SELECT * FROM instances ORDER BY last_seen DESC"
+            ).fetchall()
         return [dict(row) for row in rows]
 
-    def overview(self) -> Dict[str, Any]:
+    def overview(self, scope: Optional[Any] = None) -> Dict[str, Any]:
         """Landing-page aggregate: per-instance rollups + org totals
-        + the most recent sessions."""
+        + the most recent sessions — all narrowed to the token scope
+        (a user token sees only its own footprint, never org totals)."""
+        scope_sql, scope_params = self._scope_clause(scope)
         instance_rows = self._db.execute(
-            """
+            f"""
             SELECT i.*,
                    COUNT(s.session_id) AS sessions,
                    COALESCE(SUM(s.llm_calls), 0) AS llm_calls,
@@ -465,13 +525,15 @@ class TraceDatabase:
                        AS tokens,
                    COALESCE(SUM(s.errors), 0) AS errors
             FROM instances i
-            LEFT JOIN sessions s ON s.instance_id = i.instance_id
+            LEFT JOIN sessions s ON s.instance_id = i.instance_id{scope_sql}
             GROUP BY i.instance_id
+            {'HAVING COUNT(s.session_id) > 0' if scope_params else ''}
             ORDER BY i.last_seen DESC
-            """
+            """,
+            scope_params,
         ).fetchall()
         totals_row = self._db.execute(
-            """
+            f"""
             SELECT COUNT(*) AS sessions,
                    COALESCE(SUM(llm_calls), 0) AS llm_calls,
                    COALESCE(SUM(tool_calls), 0) AS tool_calls,
@@ -481,13 +543,15 @@ class TraceDatabase:
                        AS total_tokens,
                    COALESCE(SUM(errors), 0) AS errors,
                    COUNT(DISTINCT NULLIF(user_id, '')) AS users
-            FROM sessions
-            """
+            FROM sessions s
+            WHERE 1=1{scope_sql}
+            """,
+            scope_params,
         ).fetchone()
         events_row = self._db.execute(
             "SELECT COUNT(*) AS events FROM events"
         ).fetchone()
-        recent = self.list_sessions(limit=8, offset=0)
+        recent = self.list_sessions(limit=8, offset=0, scope=scope)
         return {
             "instances": [dict(row) for row in instance_rows],
             "totals": {

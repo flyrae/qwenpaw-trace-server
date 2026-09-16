@@ -7,9 +7,12 @@ Run:
 
 Environment:
     TRACE_DB     SQLite path (default: <repo>/server/traces.db)
-    TRACE_TOKEN  when set, all endpoints require `Authorization:
-                 Bearer <token>`; when unset the server is open
-                 (suitable for a private network / gateway auth).
+    TRACE_TOKEN  admin token; when set, all endpoints require
+                 `Authorization: Bearer <token>`; when unset the
+                 server is open (private network / gateway auth)
+    TRACE_TOKENS_FILE  JSON map of per-user tokens with user/instance
+                 read scopes (see auth.py); ingest accepts any valid
+                 token, reads are filtered by scope
     TRACE_UI_DIR static UI directory (default: <repo>/server/ui)
 """
 from __future__ import annotations
@@ -26,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from auth import Scope, TokenStore
 from storage import TraceDatabase
 
 logging.basicConfig(level=logging.INFO)
@@ -38,8 +42,18 @@ UI_DIR = Path(os.environ.get("TRACE_UI_DIR") or SERVER_ROOT / "ui")
 
 MAX_BATCH_EVENTS = 50_000
 
-app = FastAPI(title="agent-trace collector", version="0.1.0")
+app = FastAPI(title="agent-trace collector", version="0.3.0")
 db = TraceDatabase(DB_PATH)
+tokens = TokenStore.from_env(os.environ)
+if tokens:
+    restricted = sum(
+        1 for s in tokens.scopes.values() if not s.unrestricted
+    )
+    logger.info(
+        "agent-trace server: %d token(s) loaded (%d restricted)",
+        len(tokens.scopes),
+        restricted,
+    )
 
 # Standalone-UI deployments serve the bundle from another origin;
 # same-origin (default) works without CORS too.
@@ -53,7 +67,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    if TOKEN:
+    if tokens:
         path = request.url.path
         public = (
             path == "/healthz"
@@ -64,9 +78,20 @@ async def auth_guard(request: Request, call_next):
         )
         if not public:
             header = request.headers.get("Authorization") or ""
-            if header.strip() != f"Bearer {TOKEN}":
+            supplied = header[7:].strip() if header.startswith(
+                "Bearer "
+            ) else ""
+            scope = tokens.lookup(supplied)
+            if scope is None:
                 return PlainTextResponse("unauthorized", status_code=401)
+            request.state.scope = scope
     return await call_next(request)
+
+
+def _scope(request: Request) -> Scope:
+    """Token scope of the current request (unrestricted when the
+    server runs without tokens)."""
+    return getattr(request.state, "scope", Scope())
 
 
 @app.get("/healthz")
@@ -117,29 +142,45 @@ async def ingest(request: Request) -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
-def _session_or_404(session_id: str, instance: Optional[str]):
+def _session_or_404(
+    session_id: str,
+    instance: Optional[str],
+    scope: Scope,
+):
     row = db.resolve_session(session_id, instance)
     if row is None:
+        raise HTTPException(404, "not found")
+    if not scope.can_view(
+        user_id=row["user_id"],
+        instance_id=row["instance_id"],
+    ):
+        # 404 (not 403): scoped tokens must not learn that the
+        # session exists at all.
         raise HTTPException(404, "not found")
     return row
 
 
 @app.get("/api/agent-trace/sessions")
 async def list_sessions(
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     instance: Optional[str] = Query(default=None),
     user: Optional[str] = Query(default=None),
     q: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
+    scope = _scope(request)
     sessions = db.list_sessions(
         instance=instance,
         user=user,
         q=q,
         limit=limit,
         offset=offset,
+        scope=scope,
     )
-    total = db.count_sessions(instance=instance, user=user, q=q)
+    total = db.count_sessions(
+        instance=instance, user=user, q=q, scope=scope
+    )
     return {
         "sessions": sessions,
         "total": total,
@@ -148,19 +189,26 @@ async def list_sessions(
     }
 
 
+@app.get("/api/agent-trace/whoami")
+async def whoami(request: Request) -> Dict[str, Any]:
+    """Identity + scope of the current token (portal header)."""
+    return _scope(request).to_dict()
+
+
 @app.get("/api/agent-trace/instances")
-async def list_instances() -> Dict[str, Any]:
-    return {"instances": db.list_instances()}
+async def list_instances(request: Request) -> Dict[str, Any]:
+    return {"instances": db.list_instances(scope=_scope(request))}
 
 
 @app.get("/api/agent-trace/overview")
-async def overview() -> Dict[str, Any]:
-    """Landing-page aggregate for the portal."""
-    return db.overview()
+async def overview(request: Request) -> Dict[str, Any]:
+    """Landing-page aggregate for the portal, scoped to the token."""
+    return db.overview(scope=_scope(request))
 
 
 @app.get("/api/agent-trace/sessions/{session_id}")
 async def get_session(
+    request: Request,
     session_id: str,
     before_seq: Optional[int] = Query(default=None, ge=1),
     limit: int = Query(default=200, ge=1, le=2000),
@@ -168,7 +216,7 @@ async def get_session(
     q: Optional[str] = Query(default=None),
     instance: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
-    row = _session_or_404(session_id, instance)
+    row = _session_or_404(session_id, instance, _scope(request))
     events = db.list_events(
         row["instance_id"],
         session_id,
@@ -193,10 +241,11 @@ async def get_session(
 
 @app.get("/api/agent-trace/sessions/{session_id}/stats")
 async def get_session_stats(
+    request: Request,
     session_id: str,
     instance: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
-    row = _session_or_404(session_id, instance)
+    row = _session_or_404(session_id, instance, _scope(request))
     stats = db.stats(row["instance_id"], session_id)
     if stats is None:
         raise HTTPException(404, "not found")
@@ -205,10 +254,11 @@ async def get_session_stats(
 
 @app.get("/api/agent-trace/sessions/{session_id}/export")
 async def export_session(
+    request: Request,
     session_id: str,
     instance: Optional[str] = Query(default=None),
 ) -> Response:
-    row = _session_or_404(session_id, instance)
+    row = _session_or_404(session_id, instance, _scope(request))
     try:
         header = json.loads(row["header"]) if row["header"] else None
     except ValueError:

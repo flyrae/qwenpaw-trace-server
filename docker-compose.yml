@@ -9,6 +9,9 @@ services:
     environment:
       # Generate one: python -c "import secrets;print(secrets.token_urlsafe(24))"
       TRACE_TOKEN: ${TRACE_TOKEN:-}
+      # Multi-user scopes (README §2): mount tokens.json into the
+      # volume and point TRACE_TOKENS_FILE at it.
+      TRACE_TOKENS_FILE: ${TRACE_TOKENS_FILE:-}
     volumes:
       - trace-data:/data
 
