@@ -493,7 +493,9 @@
         $("recent-rows").innerHTML = list
           .map(
             (s) =>
-              '<tr class="click" data-ref="' + esc(
+              '<tr class="click" title="' +
+              (s.last_error ? "最近错误：" + esc(s.last_error) : "") +
+              '" data-ref="' + esc(
                 (s.instance_id ? s.instance_id + "~" : "") + s.session_id,
               ) + '"><td class="title-cell"><b>' +
               esc(s.title || s.session_id) + "</b></td><td>" +

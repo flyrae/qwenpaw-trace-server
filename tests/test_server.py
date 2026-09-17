@@ -234,7 +234,8 @@ class TestSessionsApi:
 
     def test_error_status_counted_in_aggregate(self, client):
         # A failed run (run/end status=error) and a failed tool call
-        # both land in the instance's error column.
+        # both land in the instance's error column; the latest error
+        # text surfaces as last_error for hover details.
         _post_batch(
             client,
             _batch(
@@ -245,13 +246,15 @@ class TestSessionsApi:
                         "tool/result",
                         {"ok": False, "error": "boom", "duration_ms": 5},
                     ),
-                    _event(3, "run/end", {"status": "error"}),
+                    _event(3, "run/end", {"status": "error", "error": "llm boom"}),
                 ]
             ),
         )
         body = client.get("/api/agent-trace/overview").json()
         assert body["totals"]["errors"] == 2
         assert body["instances"][0]["errors"] == 2
+        rows = client.get("/api/agent-trace/sessions").json()["sessions"]
+        assert rows[0]["last_error"] == "llm boom"
 
     def test_instance_filter_is_exact(self, client):
         # "edge-local" must not match "edge-local-2" — the portal

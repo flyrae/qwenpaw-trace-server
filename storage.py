@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS sessions(
     output_tokens INTEGER NOT NULL DEFAULT 0,
     status TEXT,
     event_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
     PRIMARY KEY(instance_id, session_id)
 );
 CREATE TABLE IF NOT EXISTS tokens(
@@ -81,6 +82,11 @@ CREATE TABLE IF NOT EXISTS enroll_keys(
 # Column additions for DBs created before v0.5.0.
 _MIGRATIONS = (
     ("tokens", "source", "ALTER TABLE tokens ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'"),
+    (
+        "sessions",
+        "last_error",
+        "ALTER TABLE sessions ADD COLUMN last_error TEXT",
+    ),
 )
 
 
@@ -104,12 +110,17 @@ class TraceDatabase:
         self._db.commit()
 
     def _migrate(self) -> None:
-        columns = {
-            row["name"]
-            for row in self._db.execute("PRAGMA table_info(tokens)")
-        }
+        table_columns: Dict[str, set] = {}
+        for table, _column, _ddl in _MIGRATIONS:
+            if table not in table_columns:
+                table_columns[table] = {
+                    row["name"]
+                    for row in self._db.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                }
         for table, column, ddl in _MIGRATIONS:
-            if table == "tokens" and column not in columns:
+            if column not in table_columns[table]:
                 self._db.execute(ddl)
 
     def close(self) -> None:
@@ -458,16 +469,19 @@ class TraceDatabase:
         elif event_type == "run/end":
             # status=error is the current plugin's failed-run signal
             # (the legacy run/end-error event stays supported below).
-            error = 1 if str(data.get("status") or "") == "error" else 0
+            status = str(data.get("status") or "")
+            error = 1 if status == "error" else 0
             self._db.execute(
                 """
-                UPDATE sessions SET status=?, last_t=?, errors=errors+?
+                UPDATE sessions SET status=?, last_t=?, errors=errors+?,
+                    last_error=COALESCE(?, last_error)
                 WHERE instance_id=? AND session_id=?
                 """,
                 (
-                    str(data.get("status") or ""),
+                    status,
                     event.get("t"),
                     error,
+                    str(data.get("error") or "")[:300] if error else None,
                     instance_id,
                     session_id,
                 ),
@@ -499,16 +513,34 @@ class TraceDatabase:
             self._db.execute(
                 """
                 UPDATE sessions SET tool_calls=tool_calls+1,
-                    errors=errors+?, last_t=?
+                    errors=errors+?, last_t=?,
+                    last_error=COALESCE(?, last_error)
                 WHERE instance_id=? AND session_id=?
                 """,
-                (error, event.get("t"), instance_id, session_id),
+                (
+                    error,
+                    event.get("t"),
+                    (
+                        str(data.get("error") or "")[:300]
+                        if error
+                        else None
+                    ),
+                    instance_id,
+                    session_id,
+                ),
             )
         elif event_type == "run/end-error":
             self._db.execute(
-                "UPDATE sessions SET errors=errors+1 WHERE"
-                " instance_id=? AND session_id=?",
-                (instance_id, session_id),
+                """
+                UPDATE sessions SET errors=errors+1,
+                    last_error=COALESCE(?, last_error)
+                WHERE instance_id=? AND session_id=?
+                """,
+                (
+                    str(data.get("error") or "")[:300] or None,
+                    instance_id,
+                    session_id,
+                ),
             )
         self._db.execute(
             "UPDATE sessions SET event_count=event_count+1, last_t=?"
@@ -611,6 +643,7 @@ class TraceDatabase:
                     "size_bytes": 0,
                     "mtime": 0,
                     "event_count": row["event_count"],
+                    "last_error": row["last_error"] or "",
                 }
             )
         return summaries
