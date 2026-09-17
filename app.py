@@ -67,7 +67,7 @@ BASE_PATH = _normalize_base_path(
 
 MAX_BATCH_EVENTS = 50_000
 
-app = FastAPI(title="agent-trace collector", version="0.6.0")
+app = FastAPI(title="agent-trace collector", version="0.6.1")
 db = TraceDatabase(DB_PATH)
 tokens = TokenStore.from_env(os.environ, db)
 logger.info(
