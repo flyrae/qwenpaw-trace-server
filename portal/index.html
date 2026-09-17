@@ -273,7 +273,7 @@
               <tr>
                 <th>会话</th><th>用户</th><th>实例</th><th>渠道</th>
                 <th>状态</th><th class="num">轮次</th><th class="num">Token</th>
-                <th>最近活动</th>
+                <th class="num">错误</th><th>最近活动</th>
               </tr>
             </thead>
             <tbody id="recent-rows"></tbody>
@@ -504,7 +504,11 @@
               esc(s.instance_id || "—") +
               "</td><td>" + esc(s.channel || "—") + "</td><td>" + statusTag(s.status) +
               '</td><td class="num">' + (s.runs || 0) + '</td><td class="num">' +
-              fmtNum(s.total_tokens) + '</td><td class="muted">' + fmtAgo(s.last_event_t) +
+              fmtNum(s.total_tokens) + '</td><td class="num">' +
+              (s.errors
+                ? '<span class="tag err">' + s.errors + "</span>"
+                : '<span class="muted">0</span>') +
+              '</td><td class="muted">' + fmtAgo(s.last_event_t) +
               "</td></tr>",
           )
           .join("");

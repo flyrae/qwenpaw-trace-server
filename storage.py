@@ -636,6 +636,7 @@ class TraceDatabase:
                     "runs": row["runs"],
                     "llm_calls": row["llm_calls"],
                     "tool_calls": row["tool_calls"],
+                    "errors": row["errors"],
                     "total_tokens": (
                         row["input_tokens"] + row["output_tokens"]
                     ),
