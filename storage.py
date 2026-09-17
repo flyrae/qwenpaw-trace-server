@@ -556,8 +556,8 @@ class TraceDatabase:
         where = []
         params: list = []
         if instance:
-            where.append("s.instance_id LIKE ?")
-            params.append(f"%{instance}%")
+            where.append("s.instance_id = ?")
+            params.append(instance)
         if user:
             where.append(
                 "(s.user_id LIKE ? OR s.title LIKE ?)"
@@ -620,8 +620,8 @@ class TraceDatabase:
         where = []
         params: list = []
         if instance:
-            where.append("instance_id LIKE ?")
-            params.append(f"%{instance}%")
+            where.append("instance_id = ?")
+            params.append(instance)
         if user:
             where.append("(user_id LIKE ? OR title LIKE ?)")
             params.extend([f"%{user}%", f"%{user}%"])

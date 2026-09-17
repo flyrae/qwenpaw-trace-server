@@ -161,6 +161,20 @@
       }
       td code { font-family: ui-monospace, Consolas, monospace; }
       .footnote { font-size: 12px; color: var(--ink-3); margin-top: 8px; }
+      .filter-bar {
+        display: inline-flex; gap: 8px; align-items: center;
+        margin-left: 14px; font-weight: 400;
+      }
+      .filter-bar select, .filter-bar input {
+        padding: 4px 10px; font-size: 12px;
+        border: 1px solid var(--line); border-radius: 6px;
+        outline: none; background: #fff;
+      }
+      .filter-bar select { max-width: 220px; }
+      .filter-bar input { width: 240px; }
+      .filter-bar select:focus, .filter-bar input:focus {
+        border-color: var(--brand);
+      }
 
       /* ── login gate ─────────────────────────────────────── */
       #gate {
@@ -224,7 +238,9 @@
       <div class="kpis" id="kpis"></div>
 
       <div class="section">
-        <h2>接入实例 <span class="count" id="inst-count"></span></h2>
+        <h2>接入实例 <span class="count" id="inst-count"></span>
+          <input id="inst-search" placeholder="筛选实例 / 主机…" style="margin-left: auto; width: 200px; padding: 4px 10px; font-size: 12px; border: 1px solid var(--line); border-radius: 6px; outline: none;" />
+        </h2>
         <div class="card">
           <table>
             <thead>
@@ -242,7 +258,15 @@
       </div>
 
       <div class="section">
-        <h2>最近会话 <span class="more"><a href="trace" target="_self">查看全部 →</a></span></h2>
+        <h2>会话
+          <span class="filter-bar">
+            <select id="sess-inst">
+              <option value="">全部实例</option>
+            </select>
+            <input id="sess-search" placeholder="搜索标题 / 用户 / 会话ID…" />
+          </span>
+          <span class="more"><a href="trace" target="_self">查看全部 →</a></span>
+        </h2>
         <div class="card">
           <table>
             <thead>
@@ -376,6 +400,8 @@
         return div.innerHTML;
       }
 
+      let lastOverviewInstances = [];
+
       function renderOverview(data) {
         const t = data.totals;
         const kpis = [
@@ -396,13 +422,28 @@
           .join("");
 
         const insts = data.instances || [];
-        $("inst-count").textContent = insts.length + " 台";
-        $("inst-empty").classList.toggle("hidden", insts.length > 0);
-        $("inst-rows").innerHTML = insts
+        lastOverviewInstances = insts;
+        renderInstanceRows(insts);
+        syncInstanceOptions(insts);
+      }
+
+      function renderInstanceRows(insts) {
+        const needle = ($("inst-search").value || "").trim().toLowerCase();
+        const rows = needle
+          ? insts.filter(
+              (i) =>
+                (i.instance_id || "").toLowerCase().indexOf(needle) >= 0 ||
+                (i.hostname || "").toLowerCase().indexOf(needle) >= 0,
+            )
+          : insts;
+        $("inst-count").textContent = rows.length + " 台";
+        $("inst-empty").classList.toggle("hidden", rows.length > 0);
+        $("inst-rows").innerHTML = rows
           .map(
             (i) =>
-              "<tr><td><span class=\"tag info\">" + esc(i.instance_id) +
-              "</span></td><td>" + esc(i.hostname || "—") + "</td><td class=\"muted\">" +
+              '<tr class="click inst-row" data-inst="' + esc(i.instance_id) +
+              '"><td><span class="tag info">' + esc(i.instance_id) +
+              "</span></td><td>" + esc(i.hostname || "—") + '</td><td class="muted">' +
               esc(i.plugin_version || "—") + '</td><td class="num">' + fmtNum(i.sessions) +
               '</td><td class="num">' + fmtNum(i.llm_calls) + '</td><td class="num">' +
               fmtNum(i.tokens) + '</td><td class="num">' +
@@ -410,10 +451,46 @@
               "</td><td class=\"muted\">" + fmtAgo(i.last_seen) + "</td></tr>",
           )
           .join("");
+        document
+          .querySelectorAll("#inst-rows tr.inst-row")
+          .forEach((row) =>
+            row.addEventListener("click", () => {
+              sessionFilter.instance = row.dataset.inst;
+              $("sess-inst").value = sessionFilter.instance;
+              loadSessions();
+              document.getElementById("recent-rows").scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+              });
+            }),
+          );
+      }
 
-        const recent = data.recent_sessions || [];
-        $("recent-empty").classList.toggle("hidden", recent.length > 0);
-        $("recent-rows").innerHTML = recent
+      function syncInstanceOptions(insts) {
+        const select = $("sess-inst");
+        const selected = sessionFilter.instance;
+        select.innerHTML =
+          '<option value="">全部实例</option>' +
+          insts
+            .map(
+              (i) =>
+                '<option value="' + esc(i.instance_id) + '">' +
+                esc(i.instance_id) + "</option>",
+            )
+            .join("");
+        select.value = selected;
+      }
+
+      // ── session list: filtered, independent of the overview ──
+      const sessionFilter = { instance: "", q: "" };
+      let sessionSearchTimer = null;
+
+      function renderSessions(list) {
+        $("recent-empty").textContent = sessionFilter.instance || sessionFilter.q
+          ? "没有匹配的会话 —— 调整筛选条件试试"
+          : "暂无会话 —— 与智能体对话后出现在这里";
+        $("recent-empty").classList.toggle("hidden", list.length > 0);
+        $("recent-rows").innerHTML = list
           .map(
             (s) =>
               '<tr class="click" data-ref="' + esc(
@@ -421,7 +498,8 @@
               ) + '"><td class="title-cell"><b>' +
               esc(s.title || s.session_id) + "</b></td><td>" +
               (s.user_id ? "👤 " + esc(s.user_id) : '<span class="muted">—</span>') +
-              "</td><td class=\"muted\">" + esc(s.hostname || s.instance_id || "—") +
+              '</td><td class="muted" title="' + esc(s.hostname || "") + '">' +
+              esc(s.instance_id || "—") +
               "</td><td>" + esc(s.channel || "—") + "</td><td>" + statusTag(s.status) +
               '</td><td class="num">' + (s.runs || 0) + '</td><td class="num">' +
               fmtNum(s.total_tokens) + '</td><td class="muted">' + fmtAgo(s.last_event_t) +
@@ -438,6 +516,19 @@
                 encodeURIComponent(row.dataset.ref);
             }),
           );
+      }
+
+      async function loadSessions() {
+        const params = new URLSearchParams({ limit: "20" });
+        if (sessionFilter.instance)
+          params.set("instance", sessionFilter.instance);
+        if (sessionFilter.q) params.set("q", sessionFilter.q);
+        try {
+          const data = await api("/sessions?" + params.toString());
+          renderSessions(data.sessions);
+        } catch (exc) {
+          if (!exc || !exc.unauthorized) console.warn(exc);
+        }
       }
 
       // ── token admin (visible to unrestricted tokens only) ──
@@ -640,6 +731,7 @@
           $("health-dot").classList.remove("off");
           $("health-text").textContent = "服务正常";
           renderOverview(data);
+          loadSessions();
           try {
             const me = await api("/whoami");
             isAdmin = !me.restricted;
@@ -689,6 +781,22 @@
       $("logout").addEventListener("click", () => {
         localStorage.removeItem("trace_token");
         location.reload();
+      });
+
+      // ── filters ─────────────────────────────────────────────
+      $("inst-search").addEventListener("input", () => {
+        renderInstanceRows(lastOverviewInstances);
+      });
+      $("sess-inst").addEventListener("change", (event) => {
+        sessionFilter.instance = event.target.value;
+        loadSessions();
+      });
+      $("sess-search").addEventListener("input", (event) => {
+        clearTimeout(sessionSearchTimer);
+        sessionSearchTimer = setTimeout(() => {
+          sessionFilter.q = event.target.value.trim();
+          loadSessions();
+        }, 300);
       });
 
       tick();

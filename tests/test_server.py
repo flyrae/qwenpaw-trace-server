@@ -232,6 +232,26 @@ class TestSessionsApi:
         assert len(lines) == 2
         assert json.loads(lines[0])["type"] == "run/start"
 
+    def test_instance_filter_is_exact(self, client):
+        # "edge-local" must not match "edge-local-2" — the portal
+        # filter dropdown passes full instance ids.
+        for inst in ("edge-local", "edge-local-2"):
+            _post_batch(
+                client,
+                _batch(
+                    instance_id=inst,
+                    events=[
+                        _event(1, "run/end", {"status": "success"}),
+                    ],
+                ),
+            )
+        resp = client.get(
+            "/api/agent-trace/sessions", params={"instance": "edge-local"}
+        )
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["sessions"][0]["instance_id"] == "edge-local"
+
     def test_run_start_user_id_backfills_console_identity(self, client):
         # Console sessions carry the requester on run/start (no
         # message/inbound); the aggregate row must pick it up.
