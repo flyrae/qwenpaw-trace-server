@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py storage.py ./
+COPY app.py storage.py auth.py ./
 COPY portal/ ./portal/
 COPY ui/index.html ./ui/index.html
 COPY ui/vendor/ ./ui/vendor/

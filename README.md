@@ -189,7 +189,7 @@ TRACE_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(24))") \
     docker compose up -d --build       # 数据持久化在 named volume trace-data
 
 # 或直接 docker
-docker build -t agent-trace-server:0.3 .
+docker build -t agent-trace-server:0.5 .
 docker run -d --name trace-server -p 8790:8790 \
     -e TRACE_TOKEN=... -v trace-data:/data --restart unless-stopped \
     agent-trace-server:0.1
