@@ -565,9 +565,10 @@ class TraceDatabase:
             params.extend([f"%{user}%", f"%{user}%"])
         if q:
             where.append(
-                "(s.session_id LIKE ? OR s.title LIKE ? OR s.agent_id LIKE ?)"
+                "(s.session_id LIKE ? OR s.title LIKE ?"
+                " OR s.agent_id LIKE ? OR s.user_id LIKE ?)"
             )
-            params.extend([f"%{q}%"] * 3)
+            params.extend([f"%{q}%"] * 4)
         scope_sql, scope_params = self._scope_clause(scope)
         clause = (
             f"WHERE {' AND '.join(where)}{scope_sql}" if where
@@ -626,8 +627,11 @@ class TraceDatabase:
             where.append("(user_id LIKE ? OR title LIKE ?)")
             params.extend([f"%{user}%", f"%{user}%"])
         if q:
-            where.append("(session_id LIKE ? OR title LIKE ?)")
-            params.extend([f"%{q}%"] * 2)
+            where.append(
+                "(s.session_id LIKE ? OR s.title LIKE ?"
+                " OR s.agent_id LIKE ? OR s.user_id LIKE ?)"
+            )
+            params.extend([f"%{q}%"] * 4)
         scope_sql, scope_params = self._scope_clause(scope)
         clause = (
             f"WHERE {' AND '.join(where)}{scope_sql}" if where
