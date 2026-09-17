@@ -35,6 +35,7 @@ TRACE_DB=./traces.db TRACE_TOKEN=一个长随机串 \
 | `TRACE_TOKENS_FILE` | 空 | 多用户令牌**种子文件**（JSON，见 §2）：仅首次导入 DB，之后以管理台为准 |
 | `TRACE_UI_DIR` | `./ui` | 轨迹壳目录；删除则 `/trace` 关闭 |
 | `TRACE_PORTAL_DIR` | `./portal` | 门户目录 |
+| `TRACE_BASE_PATH` | 空 | 反向代理部署用的统一 URL 前缀，如 `/agent-trace`（见 §7） |
 
 ## 2. 多用户令牌与作用域隔离
 
@@ -189,10 +190,10 @@ TRACE_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(24))") \
     docker compose up -d --build       # 数据持久化在 named volume trace-data
 
 # 或直接 docker
-docker build -t agent-trace-server:0.5 .
+docker build -t agent-trace-server:0.6 .
 docker run -d --name trace-server -p 8790:8790 \
     -e TRACE_TOKEN=... -v trace-data:/data --restart unless-stopped \
-    agent-trace-server:0.1
+    agent-trace-server:0.6
 ```
 
 镜像要点：`python:3.12-slim` + fastapi/uvicorn（仅两个依赖）；数据库
@@ -208,3 +209,38 @@ docker run -d --name trace-server -p 8790:8790 \
 K8s 要点：`Deployment`（镜像 + `TRACE_TOKEN` from Secret）+
 `PersistentVolumeClaim` 挂 `/data` + `readinessProbe`/`livenessProbe`
 GET `/healthz`，无需其它特殊配置。
+
+## 7. 反向代理部署（统一 URL 前缀）
+
+一台 nginx 后面挂多个服务时，把整个采集服务挂到某个前缀下（如
+`/agent-trace`）即可按路径分流，互不干扰：
+
+```bash
+TRACE_BASE_PATH=/agent-trace uvicorn app:app --port 8790
+# 容器：docker run -e TRACE_BASE_PATH=/agent-trace ...（compose 已透传）
+```
+
+效果：所有路径（`/ingest`、`/enroll`、`/healthz`、`/api/agent-trace/*`、
+`/trace`、门户 `/`）统一挂到 `/agent-trace/` 下；门户和轨迹页会从自身
+URL 自动推断 API 前缀，无需任何前端配置。
+
+nginx 只需一段透传（**不要** strip 前缀）：
+
+```nginx
+location /agent-trace/ {
+    proxy_pass http://127.0.0.1:8790;     # 保留路径原样转发
+    proxy_set_header Host $host;
+    client_max_body_size 4m;              # 允许 gzip 批量上报
+}
+```
+
+边端相应配置（插件无需改动，`remote_url` 指向前缀即可）：
+
+```json
+{ "remote_enabled": true,
+  "remote_url": "https://company.internal/agent-trace",
+  "remote_enroll_key": "enroll_..." }
+```
+
+注意：设置前缀后无前缀路径不再提供服务（鉴权中间件直接 401）；
+镜像 `HEALTHCHECK` 会自动读取 `TRACE_BASE_PATH` 拼出探测路径。

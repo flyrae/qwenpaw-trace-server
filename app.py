@@ -17,6 +17,12 @@ Environment:
                  of truth and issue/revoke apply immediately.
                  Ingest accepts any valid token, reads are filtered
                  by scope
+    TRACE_BASE_PATH  mount everything under a URL prefix, e.g.
+                 /agent-trace for reverse-proxy deployments that
+                 route several services off one host. Every path
+                 (/ingest /enroll /healthz /api/... /trace /) moves
+                 under it; edges set remote_url to
+                 http://host/agent-trace unchanged.
     TRACE_UI_DIR static UI directory (default: <repo>/server/ui)
 """
 from __future__ import annotations
@@ -26,6 +32,7 @@ import json
 import logging
 import os
 import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,7 +41,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from datetime import datetime, timedelta, timezone
 
 from auth import Scope, TokenStore
 from storage import TraceDatabase
@@ -46,9 +52,22 @@ SERVER_ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TRACE_DB") or SERVER_ROOT / "traces.db")
 UI_DIR = Path(os.environ.get("TRACE_UI_DIR") or SERVER_ROOT / "ui")
 
+
+def _normalize_base_path(raw: str) -> str:
+    """'' or '/agent-trace' — leading slash, no trailing slash."""
+    value = (raw or "").strip().rstrip("/")
+    if value and not value.startswith("/"):
+        value = "/" + value
+    return value
+
+
+BASE_PATH = _normalize_base_path(
+    os.environ.get("TRACE_BASE_PATH") or ""
+)
+
 MAX_BATCH_EVENTS = 50_000
 
-app = FastAPI(title="agent-trace collector", version="0.5.0")
+app = FastAPI(title="agent-trace collector", version="0.6.0")
 db = TraceDatabase(DB_PATH)
 tokens = TokenStore.from_env(os.environ, db)
 logger.info(
@@ -56,6 +75,10 @@ logger.info(
     "set" if tokens.admin_token else "unset (open mode)",
     tokens.token_count(),
 )
+if BASE_PATH:
+    logger.info(
+        "agent-trace server: mounted under base path %s", BASE_PATH
+    )
 
 # Standalone-UI deployments serve the bundle from another origin;
 # same-origin (default) works without CORS too.
@@ -67,16 +90,22 @@ app.add_middleware(
 )
 
 
+# Path building blocks under the optional TRACE_BASE_PATH prefix.
+API = f"{BASE_PATH}/api/agent-trace"
+ADMIN = f"{API}/admin"
+
+
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    if tokens.auth_enabled and request.url.path != "/enroll":
+    if tokens.auth_enabled and request.url.path != f"{BASE_PATH}/enroll":
         path = request.url.path
         public = (
-            path == "/healthz"
-            or path == "/"
-            or path == "/index.html"
-            or path == "/favicon.ico"
-            or path.startswith("/trace")
+            path == f"{BASE_PATH}/healthz"
+            or path == BASE_PATH
+            or path == f"{BASE_PATH}/"
+            or path == f"{BASE_PATH}/index.html"
+            or path == f"{BASE_PATH}/favicon.ico"
+            or path.startswith(f"{BASE_PATH}/trace")
         )
         if not public:
             header = request.headers.get("Authorization") or ""
@@ -96,7 +125,7 @@ def _scope(request: Request) -> Scope:
     return getattr(request.state, "scope", Scope())
 
 
-@app.get("/healthz")
+@app.get(f"{BASE_PATH}/healthz")
 async def healthz() -> Dict[str, Any]:
     return {
         "status": "ok",
@@ -120,7 +149,7 @@ async def _read_body(request: Request) -> bytes:
     return body
 
 
-@app.post("/ingest")
+@app.post(f"{BASE_PATH}/ingest")
 async def ingest(request: Request) -> Dict[str, Any]:
     body = await _read_body(request)
     try:
@@ -152,7 +181,7 @@ def _bearer(request: Request) -> str:
     return header[7:].strip() if header.startswith("Bearer ") else ""
 
 
-@app.post("/enroll")
+@app.post(f"{BASE_PATH}/enroll")
 async def enroll(request: Request) -> Dict[str, Any]:
     key_row = db.get_valid_enroll_key(_bearer(request))
     if key_row is None:
@@ -208,7 +237,7 @@ def _session_or_404(
     return row
 
 
-@app.get("/api/agent-trace/sessions")
+@app.get(f"{API}/sessions")
 async def list_sessions(
     request: Request,
     limit: int = Query(default=100, ge=1, le=500),
@@ -237,7 +266,7 @@ async def list_sessions(
     }
 
 
-@app.get("/api/agent-trace/whoami")
+@app.get(f"{API}/whoami")
 async def whoami(request: Request) -> Dict[str, Any]:
     """Identity + scope of the current token (portal header)."""
     return _scope(request).to_dict()
@@ -280,7 +309,7 @@ def _clean_allow_list(value: Optional[List[str]]) -> Optional[List[str]]:
     return items or None
 
 
-@app.get("/api/agent-trace/admin/tokens")
+@app.get(f"{ADMIN}/tokens")
 async def admin_list_tokens(request: Request) -> Dict[str, Any]:
     _require_admin(request)
     return {
@@ -305,7 +334,7 @@ async def admin_list_tokens(request: Request) -> Dict[str, Any]:
 
 
 @app.post(
-    "/api/agent-trace/admin/tokens",
+    f"{ADMIN}/tokens",
     status_code=201,
 )
 async def admin_create_token(
@@ -332,7 +361,7 @@ async def admin_create_token(
     }
 
 
-@app.delete("/api/agent-trace/admin/tokens/{token_id}")
+@app.delete(f"{ADMIN}/tokens/{{token_id}}")
 async def admin_revoke_token(
     request: Request, token_id: int
 ) -> Dict[str, Any]:
@@ -349,7 +378,7 @@ async def admin_revoke_token(
 # ----------------------------------------------------------------------
 
 
-@app.get("/api/agent-trace/admin/enroll-keys")
+@app.get(f"{ADMIN}/enroll-keys")
 async def admin_list_enroll_keys(request: Request) -> Dict[str, Any]:
     _require_admin(request)
     return {
@@ -370,7 +399,7 @@ async def admin_list_enroll_keys(request: Request) -> Dict[str, Any]:
 
 
 @app.post(
-    "/api/agent-trace/admin/enroll-keys",
+    f"{ADMIN}/enroll-keys",
     status_code=201,
 )
 async def admin_create_enroll_key(
@@ -407,7 +436,7 @@ async def admin_create_enroll_key(
     }
 
 
-@app.delete("/api/agent-trace/admin/enroll-keys/{key_id}")
+@app.delete(f"{ADMIN}/enroll-keys/{{key_id}}")
 async def admin_revoke_enroll_key(
     request: Request, key_id: int
 ) -> Dict[str, Any]:
@@ -420,18 +449,18 @@ async def admin_revoke_enroll_key(
     return {"ok": True}
 
 
-@app.get("/api/agent-trace/instances")
+@app.get(f"{API}/instances")
 async def list_instances(request: Request) -> Dict[str, Any]:
     return {"instances": db.list_instances(scope=_scope(request))}
 
 
-@app.get("/api/agent-trace/overview")
+@app.get(f"{API}/overview")
 async def overview(request: Request) -> Dict[str, Any]:
     """Landing-page aggregate for the portal, scoped to the token."""
     return db.overview(scope=_scope(request))
 
 
-@app.get("/api/agent-trace/sessions/{session_id}")
+@app.get(f"{API}/sessions/{{session_id}}")
 async def get_session(
     request: Request,
     session_id: str,
@@ -464,7 +493,7 @@ async def get_session(
     }
 
 
-@app.get("/api/agent-trace/sessions/{session_id}/stats")
+@app.get(f"{API}/sessions/{{session_id}}/stats")
 async def get_session_stats(
     request: Request,
     session_id: str,
@@ -477,7 +506,7 @@ async def get_session_stats(
     return stats
 
 
-@app.get("/api/agent-trace/sessions/{session_id}/export")
+@app.get(f"{API}/sessions/{{session_id}}/export")
 async def export_session(
     request: Request,
     session_id: str,
@@ -517,7 +546,7 @@ PORTAL_DIR = Path(
 # Mount order matters: "/trace" must register before the catch-all "/".
 if UI_DIR.exists():
     app.mount(
-        "/trace",
+        f"{BASE_PATH}/trace",
         StaticFiles(directory=UI_DIR, html=True),
         name="ui",
     )
@@ -529,12 +558,16 @@ else:
 
 if PORTAL_DIR.exists():
     app.mount(
-        "/",
+        BASE_PATH or "/",
         StaticFiles(directory=PORTAL_DIR, html=True),
         name="portal",
     )
 elif UI_DIR.exists():
-    app.mount("/", StaticFiles(directory=UI_DIR, html=True), name="ui")
+    app.mount(
+        BASE_PATH or "/",
+        StaticFiles(directory=UI_DIR, html=True),
+        name="ui",
+    )
 else:
     logger.info(
         "agent-trace server: no static directories under %s (API-only)",

@@ -12,6 +12,9 @@ services:
       # Multi-user scopes (README §2): mount tokens.json into the
       # volume and point TRACE_TOKENS_FILE at it.
       TRACE_TOKENS_FILE: ${TRACE_TOKENS_FILE:-}
+      # Reverse-proxy deployments: mount everything under a prefix,
+      # e.g. /agent-trace (README §7).
+      TRACE_BASE_PATH: ${TRACE_BASE_PATH:-}
     volumes:
       - trace-data:/data
 

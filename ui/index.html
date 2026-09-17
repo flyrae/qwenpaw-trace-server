@@ -42,6 +42,14 @@
           window.__TRACE_API_BASE__ ||
           window.localStorage.getItem("trace_api_base") ||
           "";
+        if (!apiBase) {
+          // Reverse-proxy deployments mount the whole server under a
+          // base path (TRACE_BASE_PATH, e.g. /agent-trace): this page
+          // then lives at {base}/trace/ — infer the base from our own
+          // URL so API calls go to {base}/api/... without any setup.
+          var m = window.location.pathname.match(/^(.*)\/trace(\/|$)/);
+          if (m) apiBase = m[1];
+        }
         var token = "";
         try {
           token = window.localStorage.getItem("trace_token") || "";

@@ -27,7 +27,7 @@ VOLUME ["/data"]
 EXPOSE 8790
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8790/healthz', timeout=4)"
+    CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:8790'+os.environ.get('TRACE_BASE_PATH','').rstrip('/')+'/healthz', timeout=4)"
 
 # TRACE_TOKEN is intentionally unset by default (open collector on a
 # private network); set it via `-e TRACE_TOKEN=...` in production.

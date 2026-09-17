@@ -242,7 +242,7 @@
       </div>
 
       <div class="section">
-        <h2>最近会话 <span class="more"><a href="/trace" target="_self">查看全部 →</a></span></h2>
+        <h2>最近会话 <span class="more"><a href="trace" target="_self">查看全部 →</a></span></h2>
         <div class="card">
           <table>
             <thead>
@@ -305,7 +305,12 @@
     </div>
 
     <script>
-      const API = "/api/agent-trace";
+      // Reverse-proxy deployments mount the server under a base path
+      // (TRACE_BASE_PATH, e.g. /agent-trace) and this page lives at
+      // {base}/ or {base}/index.html — derive the base from our own
+      // URL so API calls and the /trace link work unprefixed too.
+      var BASE = location.pathname.replace(/\/(index\.html)?$/, "");
+      const API = BASE + "/api/agent-trace";
       const $ = (id) => document.getElementById(id);
 
       function token() {
@@ -428,6 +433,7 @@
           .forEach((row) =>
             row.addEventListener("click", () => {
               window.location.href =
+                BASE +
                 "/trace/?session=" +
                 encodeURIComponent(row.dataset.ref);
             }),
