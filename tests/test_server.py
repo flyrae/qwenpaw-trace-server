@@ -232,6 +232,44 @@ class TestSessionsApi:
         assert len(lines) == 2
         assert json.loads(lines[0])["type"] == "run/start"
 
+    def test_run_start_user_id_backfills_console_identity(self, client):
+        # Console sessions carry the requester on run/start (no
+        # message/inbound); the aggregate row must pick it up.
+        _post_batch(
+            client,
+            _batch(
+                events=[
+                    _event(
+                        1,
+                        "run/start",
+                        {"channel": "console", "user_id": "alice"},
+                    ),
+                    _event(2, "run/end", {"status": "success"}),
+                ]
+            ),
+        )
+        rows = client.get("/api/agent-trace/sessions").json()["sessions"]
+        assert rows[0]["user_id"] == "alice"
+
+    def test_first_identity_wins(self, client):
+        # A later inbound with a different user must not overwrite
+        # the identity already recorded from run/start.
+        _post_batch(
+            client,
+            _batch(
+                events=[
+                    _event(1, "run/start", {"user_id": "alice"}),
+                    _event(
+                        2,
+                        "message/inbound",
+                        {"user_id": "bob", "text": "hi"},
+                    ),
+                ]
+            ),
+        )
+        rows = client.get("/api/agent-trace/sessions").json()["sessions"]
+        assert rows[0]["user_id"] == "alice"
+
     def test_overview_aggregate(self, client):
         events = [
             _event(

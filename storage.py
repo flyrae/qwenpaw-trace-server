@@ -422,6 +422,19 @@ class TraceDatabase:
                     (text.strip()[:80], instance_id, session_id),
                 )
         elif event_type == "run/start":
+            # Console sessions carry no message/inbound; the run's
+            # requester (AgentRequest.user_id, e.g. the Console
+            # login) rides on run/start instead.
+            user_id = data.get("user_id")
+            if isinstance(user_id, str) and user_id:
+                self._db.execute(
+                    """
+                    UPDATE sessions SET user_id=?
+                    WHERE instance_id=? AND session_id=?
+                      AND (user_id IS NULL OR user_id='')
+                    """,
+                    (user_id, instance_id, session_id),
+                )
             self._db.execute(
                 """
                 UPDATE sessions SET runs=runs+1,
