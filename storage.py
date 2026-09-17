@@ -456,14 +456,18 @@ class TraceDatabase:
                     (query.strip()[:80], instance_id, session_id),
                 )
         elif event_type == "run/end":
+            # status=error is the current plugin's failed-run signal
+            # (the legacy run/end-error event stays supported below).
+            error = 1 if str(data.get("status") or "") == "error" else 0
             self._db.execute(
                 """
-                UPDATE sessions SET status=?, last_t=?
+                UPDATE sessions SET status=?, last_t=?, errors=errors+?
                 WHERE instance_id=? AND session_id=?
                 """,
                 (
                     str(data.get("status") or ""),
                     event.get("t"),
+                    error,
                     instance_id,
                     session_id,
                 ),

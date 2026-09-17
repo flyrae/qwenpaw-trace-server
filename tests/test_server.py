@@ -232,6 +232,27 @@ class TestSessionsApi:
         assert len(lines) == 2
         assert json.loads(lines[0])["type"] == "run/start"
 
+    def test_error_status_counted_in_aggregate(self, client):
+        # A failed run (run/end status=error) and a failed tool call
+        # both land in the instance's error column.
+        _post_batch(
+            client,
+            _batch(
+                events=[
+                    _event(1, "run/start", {}),
+                    _event(
+                        2,
+                        "tool/result",
+                        {"ok": False, "error": "boom", "duration_ms": 5},
+                    ),
+                    _event(3, "run/end", {"status": "error"}),
+                ]
+            ),
+        )
+        body = client.get("/api/agent-trace/overview").json()
+        assert body["totals"]["errors"] == 2
+        assert body["instances"][0]["errors"] == 2
+
     def test_instance_filter_is_exact(self, client):
         # "edge-local" must not match "edge-local-2" — the portal
         # filter dropdown passes full instance ids.
